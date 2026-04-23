@@ -1,0 +1,567 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>家族会議レポート プロトタイプ</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<style>
+  .log-line { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+</style>
+</head>
+<body class="bg-gray-50 text-gray-900 min-h-screen">
+  <div class="max-w-3xl mx-auto p-4 space-y-6">
+    <header class="py-4 border-b">
+      <h1 class="text-2xl font-bold">家族会議レポート プロトタイプ</h1>
+      <p class="text-sm text-gray-500">Step1: ローカル検証用（APIキーはブラウザ入力）</p>
+    </header>
+
+    <!-- APIキー入力 -->
+    <section class="bg-white rounded-lg shadow p-4 space-y-3">
+      <h2 class="font-semibold">APIキー</h2>
+      <div>
+        <label class="block text-sm mb-1" for="openaiKey">OpenAI API Key</label>
+        <input id="openaiKey" type="password" autocomplete="off"
+               class="w-full border rounded px-3 py-2 text-sm" placeholder="sk-..." />
+      </div>
+      <div>
+        <label class="block text-sm mb-1" for="anthropicKey">Anthropic API Key</label>
+        <input id="anthropicKey" type="password" autocomplete="off"
+               class="w-full border rounded px-3 py-2 text-sm" placeholder="sk-ant-..." />
+      </div>
+      <label class="flex items-center gap-2 text-sm">
+        <input id="saveKeys" type="checkbox" />
+        localStorageに保存する（このブラウザのみ）
+      </label>
+    </section>
+
+    <!-- 録音 -->
+    <section class="bg-white rounded-lg shadow p-4 space-y-3">
+      <h2 class="font-semibold">録音</h2>
+      <div class="flex items-center gap-4">
+        <button id="recordBtn" class="px-4 py-2 rounded bg-red-600 text-white font-medium">
+          ● 録音開始
+        </button>
+        <span class="text-sm">経過時間: <span id="elapsed" class="font-mono">00:00</span></span>
+      </div>
+      <p id="recordingMime" class="text-xs text-gray-500"></p>
+    </section>
+
+    <!-- 進捗ログ -->
+    <section class="bg-white rounded-lg shadow p-4 space-y-2">
+      <h2 class="font-semibold">進捗ログ</h2>
+      <div id="logArea" class="bg-gray-900 text-gray-100 rounded p-3 max-h-64 overflow-auto space-y-1">
+        <div class="log-line text-gray-400">（ここにログが表示されます）</div>
+      </div>
+    </section>
+
+    <!-- 結果表示 -->
+    <section class="bg-white rounded-lg shadow p-4 space-y-3">
+      <h2 class="font-semibold">結果</h2>
+
+      <details class="border rounded">
+        <summary class="cursor-pointer px-3 py-2 bg-gray-100 text-sm font-medium">文字起こし全文</summary>
+        <pre id="transcriptText" class="p-3 text-sm whitespace-pre-wrap break-words"></pre>
+      </details>
+
+      <details class="border rounded">
+        <summary class="cursor-pointer px-3 py-2 bg-gray-100 text-sm font-medium">Claude 生JSON出力</summary>
+        <pre id="claudeRaw" class="p-3 text-sm whitespace-pre-wrap break-words"></pre>
+      </details>
+
+      <div>
+        <h3 class="text-sm font-semibold mb-2">HTMLレポート プレビュー</h3>
+        <iframe id="reportFrame" class="w-full h-[600px] border rounded bg-white"></iframe>
+      </div>
+    </section>
+
+    <!-- デバッグ -->
+    <section class="bg-white rounded-lg shadow p-4 space-y-3">
+      <h2 class="font-semibold">デバッグ</h2>
+      <audio id="audioPlayer" controls class="w-full"></audio>
+      <div>
+        <a id="downloadLink" class="inline-block px-3 py-2 rounded bg-gray-800 text-white text-sm pointer-events-none opacity-50" download>
+          録音ファイルをダウンロード
+        </a>
+      </div>
+    </section>
+  </div>
+
+<script>
+// ---------------------------------------------------
+// 状態オブジェクト
+// ---------------------------------------------------
+const state = {
+  mediaRecorder: null,
+  chunks: [],
+  stream: null,
+  recording: false,
+  startTime: 0,
+  timerId: null,
+  mimeType: '',
+  lastBlob: null,
+};
+
+const el = {
+  openaiKey: document.getElementById('openaiKey'),
+  anthropicKey: document.getElementById('anthropicKey'),
+  saveKeys: document.getElementById('saveKeys'),
+  recordBtn: document.getElementById('recordBtn'),
+  elapsed: document.getElementById('elapsed'),
+  recordingMime: document.getElementById('recordingMime'),
+  logArea: document.getElementById('logArea'),
+  transcriptText: document.getElementById('transcriptText'),
+  claudeRaw: document.getElementById('claudeRaw'),
+  reportFrame: document.getElementById('reportFrame'),
+  audioPlayer: document.getElementById('audioPlayer'),
+  downloadLink: document.getElementById('downloadLink'),
+};
+
+// ---------------------------------------------------
+// APIキー管理（localStorage）
+// ---------------------------------------------------
+const LS_KEYS = { openai: 'ftr_openai_key', anthropic: 'ftr_anthropic_key', save: 'ftr_save_keys' };
+
+function loadKeys() {
+  const save = localStorage.getItem(LS_KEYS.save) === '1';
+  el.saveKeys.checked = save;
+  if (save) {
+    el.openaiKey.value = localStorage.getItem(LS_KEYS.openai) || '';
+    el.anthropicKey.value = localStorage.getItem(LS_KEYS.anthropic) || '';
+  }
+}
+function persistKeys() {
+  if (el.saveKeys.checked) {
+    localStorage.setItem(LS_KEYS.save, '1');
+    localStorage.setItem(LS_KEYS.openai, el.openaiKey.value);
+    localStorage.setItem(LS_KEYS.anthropic, el.anthropicKey.value);
+  } else {
+    localStorage.removeItem(LS_KEYS.save);
+    localStorage.removeItem(LS_KEYS.openai);
+    localStorage.removeItem(LS_KEYS.anthropic);
+  }
+}
+el.saveKeys.addEventListener('change', persistKeys);
+el.openaiKey.addEventListener('input', persistKeys);
+el.anthropicKey.addEventListener('input', persistKeys);
+
+// ---------------------------------------------------
+// ログ
+// ---------------------------------------------------
+function log(msg, level = 'info') {
+  const colors = { info: 'text-gray-100', ok: 'text-green-300', err: 'text-red-300', warn: 'text-yellow-300' };
+  const div = document.createElement('div');
+  div.className = 'log-line ' + (colors[level] || colors.info);
+  const ts = new Date().toLocaleTimeString('ja-JP', { hour12: false });
+  div.textContent = `[${ts}] ${msg}`;
+  if (el.logArea.firstChild && el.logArea.firstChild.classList?.contains('text-gray-400')) {
+    el.logArea.innerHTML = '';
+  }
+  el.logArea.appendChild(div);
+  el.logArea.scrollTop = el.logArea.scrollHeight;
+}
+
+// ---------------------------------------------------
+// 録音
+// ---------------------------------------------------
+function pickMimeType() {
+  const candidates = ['audio/mp4', 'audio/webm;codecs=opus', 'audio/webm'];
+  for (const t of candidates) {
+    if (window.MediaRecorder && MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported(t)) {
+      return t;
+    }
+  }
+  return '';
+}
+
+function extFromMime(mime) {
+  if (!mime) return 'webm';
+  if (mime.startsWith('audio/mp4')) return 'mp4';
+  if (mime.startsWith('audio/webm')) return 'webm';
+  if (mime.startsWith('audio/ogg')) return 'ogg';
+  return 'dat';
+}
+
+function fmtElapsed(ms) {
+  const s = Math.floor(ms / 1000);
+  const m = Math.floor(s / 60);
+  const ss = String(s % 60).padStart(2, '0');
+  const mm = String(m).padStart(2, '0');
+  return `${mm}:${ss}`;
+}
+
+async function startRecording() {
+  if (!el.openaiKey.value.trim() || !el.anthropicKey.value.trim()) {
+    alert('OpenAIとAnthropicのAPIキーを両方入力してください。');
+    return;
+  }
+
+  try {
+    state.stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  } catch (e) {
+    log('マイクへのアクセスが拒否されました: ' + e.message, 'err');
+    return;
+  }
+
+  state.mimeType = pickMimeType();
+  el.recordingMime.textContent = '録音形式: ' + (state.mimeType || '(ブラウザデフォルト)');
+
+  const opts = state.mimeType ? { mimeType: state.mimeType } : undefined;
+  try {
+    state.mediaRecorder = new MediaRecorder(state.stream, opts);
+  } catch (e) {
+    log('MediaRecorder作成失敗: ' + e.message, 'err');
+    stopStream();
+    return;
+  }
+
+  state.chunks = [];
+  state.mediaRecorder.ondataavailable = (ev) => {
+    if (ev.data && ev.data.size > 0) state.chunks.push(ev.data);
+  };
+  state.mediaRecorder.onstop = onRecordingStopped;
+  state.mediaRecorder.start();
+
+  state.recording = true;
+  state.startTime = Date.now();
+  el.elapsed.textContent = '00:00';
+  state.timerId = setInterval(() => {
+    el.elapsed.textContent = fmtElapsed(Date.now() - state.startTime);
+  }, 500);
+
+  el.recordBtn.textContent = '■ 録音終了';
+  el.recordBtn.classList.remove('bg-red-600');
+  el.recordBtn.classList.add('bg-gray-700');
+  log('録音開始', 'ok');
+}
+
+function stopRecording() {
+  if (state.mediaRecorder && state.mediaRecorder.state !== 'inactive') {
+    state.mediaRecorder.stop();
+  }
+}
+
+function stopStream() {
+  if (state.stream) {
+    state.stream.getTracks().forEach(t => t.stop());
+    state.stream = null;
+  }
+}
+
+async function onRecordingStopped() {
+  clearInterval(state.timerId);
+  state.timerId = null;
+  state.recording = false;
+  el.recordBtn.textContent = '● 録音開始';
+  el.recordBtn.classList.add('bg-red-600');
+  el.recordBtn.classList.remove('bg-gray-700');
+
+  const usedMime = state.mediaRecorder?.mimeType || state.mimeType || 'audio/webm';
+  const blob = new Blob(state.chunks, { type: usedMime });
+  state.lastBlob = blob;
+  stopStream();
+
+  const url = URL.createObjectURL(blob);
+  el.audioPlayer.src = url;
+  el.downloadLink.href = url;
+  el.downloadLink.download = 'recording.' + extFromMime(usedMime);
+  el.downloadLink.classList.remove('pointer-events-none', 'opacity-50');
+
+  const sizeKB = (blob.size / 1024).toFixed(1);
+  log(`録音終了（${sizeKB} KB, ${usedMime}）`, 'ok');
+
+  // パイプライン起動
+  await runPipeline(blob, usedMime);
+}
+
+el.recordBtn.addEventListener('click', () => {
+  if (state.recording) stopRecording();
+  else startRecording();
+});
+
+// ---------------------------------------------------
+// Whisper API
+// ---------------------------------------------------
+async function transcribeWithWhisper(blob, mime) {
+  log('文字起こし開始（Whisper）');
+  const form = new FormData();
+  const filename = 'recording.' + extFromMime(mime);
+  form.append('file', blob, filename);
+  form.append('model', 'whisper-1');
+  form.append('language', 'ja');
+
+  const res = await fetch('https://api.openai.com/v1/audio/transcriptions', {
+    method: 'POST',
+    headers: { 'Authorization': 'Bearer ' + el.openaiKey.value.trim() },
+    body: form,
+  });
+
+  const bodyText = await res.text();
+  if (!res.ok) {
+    throw new Error('Whisper API エラー (HTTP ' + res.status + '): ' + bodyText);
+  }
+  let data;
+  try { data = JSON.parse(bodyText); }
+  catch (e) { throw new Error('Whisperレスポンスの解析失敗: ' + bodyText); }
+
+  log('文字起こし完了', 'ok');
+  return data.text || '';
+}
+
+// ---------------------------------------------------
+// Claude API
+// ---------------------------------------------------
+const SYSTEM_PROMPT = `あなたは家族会議の議事録を作成するアシスタントです。
+入力された会議の文字起こしから、指定された形式のJSONオブジェクトのみを出力してください。
+前置き、説明、コードブロック（\`\`\`）は一切不要です。JSONオブジェクトのみを返してください。
+
+# 家族の構成
+
+- えづ（パパ）
+- さり（ママ）
+
+# 出力形式
+
+{
+  "summary": "会議全体の要約",
+  "decisions": ["決定事項1", "決定事項2"],
+  "tasks": [
+    { "task": "やること", "assignee": "担当者 or \\"不明\\"", "deadline": "期限 or \\"不明\\"" }
+  ]
+}
+
+# 要約（summary）
+
+- 2〜3文で、話題と結論を時系列で簡潔にまとめる
+- 「今回何を話したか」を思い出すためのメモとして書く
+- 結論が出ていない話題は含めなくて良い
+
+# 決定事項（decisions）
+
+次に該当するものを拾う：
+- 方針、ルール、継続的に適用される決め事
+- 家族全体に関わる大きな決め事（買い物、計画、制度変更など）
+- 担当者が明確でない確定事項
+
+例：
+- 「今月から食費の上限を5万円にする」
+- 「保育園は来年4月から認可に変更する」
+- 「平日の食器洗いは交代でやる」
+
+# タスク（tasks）
+
+次に該当するものを拾う：
+- 担当者が明確な「誰かがやること」
+- 会議中に確定したもののみ（提案・未決・検討中は拾わない）
+
+各タスクの項目：
+- task: やることの内容を簡潔に
+- assignee: 担当者。"えづ" / "さり" / "両方" / "不明" のいずれか
+  - "不明" は「確定したタスクだが、話者識別ができず担当者を特定できない」場合のみ使う
+  - 未確定・検討中のものは "不明" にせず、そもそも拾わない
+- deadline: 期限。発言された表現をそのまま入れる（例：「土曜まで」「今週中」「明日」）。
+  期限への言及がなければ "不明"
+
+例：
+- { "task": "保育園の書類を提出する", "assignee": "えづ", "deadline": "金曜まで" }
+- { "task": "食材の買い出し", "assignee": "さり", "deadline": "不明" }
+- { "task": "美容院の予約を取る", "assignee": "不明", "deadline": "今週中" }
+
+# 確定/未確定の判定基準（重要）
+
+確定と判断する例（拾う）：
+- 「〇〇はえづがやるね」「了解」
+- 「じゃあ来月から変えよう」「いいよ」
+- 「これは私がやっておく」（同意や反対意見なく流れた場合）
+
+未確定と判断する例（拾わない）：
+- 「〇〇どうする？」（問いかけのまま終わった）
+- 「〇〇やった方がいいかな」（合意に至っていない）
+- 「そのうちやろう」（具体性・合意が弱い）
+- 「検討しよう」「考えておく」
+
+迷ったら拾わない。見落としは許容する。
+
+# 担当者の判定
+
+- 「えづがやる」「さりお願い」→ 名前そのまま
+- 「一緒にやる」「2人で」「交代で」→ "両方"
+- 「私がやる」「自分がやるよ」など一人称で、文脈から誰が言ったか判断できない場合
+  → タスクは拾う。assignee は "不明" にする
+- 担当が明確でない確定事項 → tasksではなくdecisionsに入れる
+
+"両方" と "不明" の使い分け：
+- "両方" = 明示的に2人で・交代でやる、と決まった場合
+- "不明" = 担当者は決まっているはずだが、文字起こしからは特定できない場合
+
+# 拾わないもの
+
+以下は無視する：
+- 感情表現や愚痴（「疲れた」「大変だよね」「最近忙しい」など）
+- 過去の出来事の振り返りで、今後の決定・行動に関係ないもの
+- 短い相槌や雑談（「うん」「そうだね」「あ、そういえば」など）
+- 提案・未決・検討中のもの
+
+# 出力のルール
+
+- JSONとして妥当な形式で返す
+- 該当項目がない場合、decisions や tasks は空配列 [] にする
+- 文字起こしに誤認識があっても、文脈から妥当に解釈できる範囲で処理する
+- 解釈が困難な箇所は無理に拾わず、拾える確実なものだけを出力する`;
+
+async function structureWithClaude(transcript) {
+  log('構造化開始（Claude）');
+  const body = {
+    model: 'claude-sonnet-4-20250514',
+    max_tokens: 1500,
+    system: SYSTEM_PROMPT,
+    messages: [{ role: 'user', content: transcript }],
+  };
+
+  const res = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: {
+      'x-api-key': el.anthropicKey.value.trim(),
+      'anthropic-version': '2023-06-01',
+      'content-type': 'application/json',
+      'anthropic-dangerous-direct-browser-access': 'true',
+    },
+    body: JSON.stringify(body),
+  });
+
+  const bodyText = await res.text();
+  if (!res.ok) {
+    throw new Error('Claude API エラー (HTTP ' + res.status + '): ' + bodyText);
+  }
+  let data;
+  try { data = JSON.parse(bodyText); }
+  catch (e) { throw new Error('Claudeレスポンスの解析失敗: ' + bodyText); }
+
+  const raw = data?.content?.[0]?.text ?? '';
+  el.claudeRaw.textContent = raw;
+
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (e) {
+    // コードフェンスが紛れ込んだ場合のフォールバック
+    const m = raw.match(/\{[\s\S]*\}/);
+    if (m) {
+      try { parsed = JSON.parse(m[0]); }
+      catch (e2) { throw new Error('ClaudeのJSONパースに失敗。raw出力を上の欄で確認してください。'); }
+    } else {
+      throw new Error('ClaudeのJSONパースに失敗。raw出力を上の欄で確認してください。');
+    }
+  }
+  log('構造化完了', 'ok');
+  return parsed;
+}
+
+// ---------------------------------------------------
+// HTMLレポート生成
+// ---------------------------------------------------
+function esc(s) {
+  return String(s ?? '').replace(/[&<>"']/g, c => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+  }[c]));
+}
+
+function buildReportHtml(data) {
+  const now = new Date();
+  const dateStr = now.toLocaleDateString('ja-JP', { year: 'numeric', month: 'long', day: 'numeric' });
+  const genStr = now.toLocaleString('ja-JP');
+
+  const decisions = Array.isArray(data?.decisions) ? data.decisions : [];
+  const tasks = Array.isArray(data?.tasks) ? data.tasks : [];
+  const summary = data?.summary || '';
+
+  const decisionsHtml = decisions.length
+    ? `<ul class="list-disc pl-5 space-y-1">${decisions.map(d => `<li>${esc(d)}</li>`).join('')}</ul>`
+    : `<p class="text-gray-500">該当なし</p>`;
+
+  const tasksHtml = tasks.length
+    ? tasks.map(t => `
+        <div class="border rounded-lg p-3 bg-white shadow-sm">
+          <p class="font-medium mb-2">${esc(t.task || '')}</p>
+          <div class="flex flex-wrap gap-2 text-xs">
+            <span class="px-2 py-0.5 rounded-full bg-blue-100 text-blue-800">担当者: ${esc(t.assignee || '不明')}</span>
+            <span class="px-2 py-0.5 rounded-full bg-amber-100 text-amber-800">期限: ${esc(t.deadline || '不明')}</span>
+          </div>
+        </div>`).join('')
+    : `<p class="text-gray-500">該当なし</p>`;
+
+  return `<!DOCTYPE html>
+<html lang="ja"><head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>家族会議レポート</title>
+<script src="https://cdn.tailwindcss.com"><\/script>
+</head>
+<body class="bg-gray-50 text-gray-900">
+<div class="max-w-2xl mx-auto p-4 space-y-6">
+  <header class="border-b pb-3">
+    <h1 class="text-2xl font-bold">家族会議レポート</h1>
+    <p class="text-sm text-gray-500">${esc(dateStr)}</p>
+  </header>
+  <section>
+    <h2 class="text-lg font-semibold mb-2">会議の要約</h2>
+    <p class="leading-relaxed">${esc(summary) || '<span class="text-gray-500">（要約なし）</span>'}</p>
+  </section>
+  <section>
+    <h2 class="text-lg font-semibold mb-2">決定事項</h2>
+    ${decisionsHtml}
+  </section>
+  <section>
+    <h2 class="text-lg font-semibold mb-2">タスク一覧</h2>
+    <div class="space-y-2">${tasksHtml}</div>
+  </section>
+  <footer class="pt-4 border-t text-xs text-gray-500">
+    生成日時: ${esc(genStr)}
+  </footer>
+</div>
+</body></html>`;
+}
+
+// ---------------------------------------------------
+// パイプライン
+// ---------------------------------------------------
+async function runPipeline(blob, mime) {
+  // 結果欄リセット
+  el.transcriptText.textContent = '';
+  el.claudeRaw.textContent = '';
+  el.reportFrame.srcdoc = '';
+
+  let transcript;
+  try {
+    transcript = await transcribeWithWhisper(blob, mime);
+    el.transcriptText.textContent = transcript;
+  } catch (e) {
+    log('文字起こし失敗: ' + e.message, 'err');
+    return;
+  }
+
+  let structured;
+  try {
+    structured = await structureWithClaude(transcript);
+  } catch (e) {
+    log('レポート生成失敗: ' + e.message, 'err');
+    return;
+  }
+
+  try {
+    log('HTML生成開始');
+    const html = buildReportHtml(structured);
+    el.reportFrame.srcdoc = html;
+    log('HTML生成完了', 'ok');
+  } catch (e) {
+    log('HTML生成失敗: ' + e.message, 'err');
+  }
+}
+
+// ---------------------------------------------------
+// 初期化
+// ---------------------------------------------------
+loadKeys();
+</script>
+</body>
+</html>
