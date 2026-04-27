@@ -73,7 +73,7 @@
 // チャンク分割: Netlify Functions の 6MB ボディ制限と 26秒 実行制限を回避するため、
 // 5分ごとに MediaRecorder を stop/start し直して独立した複数 Blob を生成する。
 // 録音終了後は全 Blob を Whisper Function へ並列送信し、結果テキストを連結して Claude に渡す。
-const SEGMENT_DURATION_MS = 5 * 60 * 1000; // 5分
+const SEGMENT_DURATION_MS = 4 * 60 * 1000; // 4分
 
 const state = {
   stream: null,
@@ -153,7 +153,7 @@ async function startRecording() {
   }
 
   state.mimeType = pickMimeType();
-  el.recordingMime.textContent = '録音形式: ' + (state.mimeType || '(ブラウザデフォルト)') + ` / ${SEGMENT_DURATION_MS / 60000}分ごとに自動分割`;
+  el.recordingMime.textContent = '録音形式: ' + (state.mimeType || '(ブラウザデフォルト)') + ` / 64kbps / ${SEGMENT_DURATION_MS / 60000}分ごとに自動分割`;
   state.segments = [];
 
   // 最初のセグメント開始
@@ -181,7 +181,11 @@ async function startRecording() {
 // 新しいセグメントの MediaRecorder を作成して録音開始
 // onstop ハンドラ内で：継続中なら次セグメント開始、停止指示なら最終処理を行う
 function startNewSegment() {
-  const opts = state.mimeType ? { mimeType: state.mimeType } : undefined;
+  // 64kbps固定。家族会議の人声であれば文字起こし精度に影響しない。
+  // Netlify Functionsの6MB制限を確実に下回らせるため明示指定する。
+  const opts = state.mimeType
+    ? { mimeType: state.mimeType, audioBitsPerSecond: 64000 }
+    : { audioBitsPerSecond: 64000 };
   let mr;
   try {
     mr = new MediaRecorder(state.stream, opts);
@@ -200,7 +204,13 @@ function startNewSegment() {
     if (blob.size > 0) {
       state.segments.push(blob);
       const sizeKB = (blob.size / 1024).toFixed(1);
-      log(`セグメント${state.segments.length} 確定（${sizeKB} KB）`);
+      const sizeMB = blob.size / 1024 / 1024;
+      // 5MB超は6MB制限ギリギリなので警告（multipart/form-dataのオーバーヘッド込みで超える可能性）
+      if (sizeMB > 5) {
+        log(`セグメント${state.segments.length} 確定（${sizeKB} KB）⚠️ サイズが大きすぎる可能性`, 'warn');
+      } else {
+        log(`セグメント${state.segments.length} 確定（${sizeKB} KB）`);
+      }
     }
     if (state.recording) {
       // 録音継続中：次セグメントへ
